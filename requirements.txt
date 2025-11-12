@@ -1,0 +1,11 @@
+﻿# Core runtime dependencies
+pillow
+qrcode
+numpy
+opencv-python
+# Optional for the PyTorch RealESRGAN backend
+torch
+torchvision
+torchaudio
+realesrgan
+spandrel

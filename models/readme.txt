@@ -1,0 +1,1 @@
+You'll need to download a RealESRGAN pth model and place it in this folder for use with the upscaler script. The default is BSRGAN.pth
