@@ -23,17 +23,3 @@ python character_modeler.py \
 replaces `{input}`, `{output}`, `{weights}`, `{format}`, `{device}`, and `{name}` for
 each character before invoking the command. Meshes plus the animation metadata are
 written to the `characters/` folder.
-
-If you would rather have the upscaler call Pix2Vox+ automatically, provide the same
-command template directly to `upscaler.py`:
-
-```
-python upscaler.py doom.wad \
-  --pix2vox-command "python ~/Pix2VoxPlusPlus/test.py --weights {weights} --input {input} --output {output} --format {format} --device {device}" \
-  --pix2vox-weights /path/to/pix2vox++/weights.pth \
-  --character-output-dir characters
-```
-
-Every run writes a subdirectory inside `characters/` named after the WAD/PK3 you are
-processing, stages the detected character sprites per animation, and then exports the
-Pix2Vox+ mesh plus the JSON keyframes beside the rest of your upscale output.
