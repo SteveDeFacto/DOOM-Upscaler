@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -40,6 +41,49 @@ try:
     import windnd  # type: ignore[import]
 except ImportError:
     windnd = None  # type: ignore[assignment]
+
+try:
+    from character_modeler import (
+        Pix2VoxCommandError,
+        SpriteAnimation as PixSpriteAnimation,
+        SpriteCharacter as PixSpriteCharacter,
+        SpriteFrame as PixSpriteFrame,
+        ensure_output_directory as ensure_pix2vox_output_dir,
+        prepare_pix2vox_views,
+        run_pix2vox_command,
+        sanitize_name as sanitize_pix2vox_name,
+        stage_views_for_pix2vox,
+        write_character_metadata,
+        write_keyframe_file,
+    )
+
+    CHARACTER_MODELER_AVAILABLE = True
+except ImportError:
+    Pix2VoxCommandError = RuntimeError  # type: ignore[assignment]
+    PixSpriteAnimation = PixSpriteCharacter = PixSpriteFrame = None  # type: ignore[assignment]
+    CHARACTER_MODELER_AVAILABLE = False
+
+    def sanitize_pix2vox_name(value: str) -> str:  # type: ignore[func-returns-value]
+        clean = re.sub(r"[^A-Za-z0-9_\-]", "-", value.strip())
+        return clean or "character"
+
+    def ensure_pix2vox_output_dir(path: Path) -> None:  # type: ignore[override]
+        path.mkdir(parents=True, exist_ok=True)
+
+    def prepare_pix2vox_views(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise RuntimeError("Pix2Vox+ integration is unavailable in this environment.")
+
+    def stage_views_for_pix2vox(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise RuntimeError("Pix2Vox+ integration is unavailable in this environment.")
+
+    def run_pix2vox_command(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise RuntimeError("Pix2Vox+ integration is unavailable in this environment.")
+
+    def write_character_metadata(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise RuntimeError("Pix2Vox+ integration is unavailable in this environment.")
+
+    def write_keyframe_file(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise RuntimeError("Pix2Vox+ integration is unavailable in this environment.")
 
 try:
     import torch  # type: ignore[import]
@@ -440,6 +484,168 @@ class TextureJob:
     category: str
     metadata: Optional[Dict[str, Any]] = None
 
+
+@dataclass
+class CharacterModelerConfig:
+    command: str
+    weights: Path
+    output_dir: Path
+    mesh_format: str
+    device: str
+    max_angles: int
+    fps: float
+
+
+@dataclass
+class CharacterFrameDescriptor:
+    character: str
+    animation: str
+    frame_token: str
+    angles: List[str]
+
+
+class CharacterSpriteCollector:
+    def __init__(self, sprite_root: Path) -> None:
+        self.sprite_root = sprite_root
+        self.sprite_root.mkdir(parents=True, exist_ok=True)
+        self._characters: Dict[str, PixSpriteCharacter] = {}
+        self._animation_lookup: Dict[str, Dict[str, PixSpriteAnimation]] = {}
+        self._frame_counters: Dict[Tuple[str, str, str], int] = defaultdict(int)
+
+    def add_frame(self, identifier: str, image_bytes: bytes, extension: Optional[str]) -> None:
+        if not CHARACTER_MODELER_AVAILABLE or PixSpriteCharacter is None or PixSpriteFrame is None:
+            return
+        descriptor = _parse_character_frame_descriptor(identifier)
+        if not descriptor:
+            return
+        ext = extension or ".png"
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        character_dir = self.sprite_root / sanitize_pix2vox_name(descriptor.character)
+        animation_dir = character_dir / sanitize_pix2vox_name(descriptor.animation)
+        animation_dir.mkdir(parents=True, exist_ok=True)
+        frame_name = f"{sanitize_pix2vox_name(descriptor.frame_token)}{ext.lower()}"
+        frame_path = animation_dir / frame_name
+        try:
+            frame_path.write_bytes(image_bytes)
+        except Exception as exc:
+            logging.debug("Failed to stage sprite %s for Pix2Vox+: %s", identifier, exc)
+            return
+        try:
+            rel_path = frame_path.relative_to(self.sprite_root)
+        except ValueError:
+            rel_path = frame_path
+        animation = self._ensure_animation(descriptor.character, descriptor.animation)
+        for angle in descriptor.angles:
+            counter_key = (descriptor.character, descriptor.animation, angle)
+            frame_index = self._frame_counters[counter_key]
+            self._frame_counters[counter_key] = frame_index + 1
+            frame = PixSpriteFrame(
+                path=frame_path,
+                rel_path=rel_path,
+                angle=angle,
+                frame_index=frame_index,
+                animation=descriptor.animation,
+            )
+            animation.frames_by_angle.setdefault(angle, []).append(frame)
+
+    def _ensure_animation(self, character_name: str, animation_name: str) -> PixSpriteAnimation:
+        assert PixSpriteCharacter is not None and PixSpriteAnimation is not None
+        character = self._characters.get(character_name)
+        if character is None:
+            character = PixSpriteCharacter(name=character_name, animations=[])
+            self._characters[character_name] = character
+            self._animation_lookup[character_name] = {}
+        animation_map = self._animation_lookup[character_name]
+        animation = animation_map.get(animation_name)
+        if animation is None:
+            animation = PixSpriteAnimation(name=animation_name)
+            animation_map[animation_name] = animation
+            character.animations.append(animation)
+        return animation
+
+    def has_characters(self) -> bool:
+        return bool(self._characters)
+
+    def iter_characters(self) -> List[PixSpriteCharacter]:
+        return list(self._characters.values())
+
+
+def _parse_character_frame_descriptor(identifier: str) -> Optional[CharacterFrameDescriptor]:
+    base = Path(identifier).stem
+    if not base:
+        return None
+    match = CHARACTER_FRAME_PATTERN.search(base.lower())
+    if not match:
+        return None
+    prefix = base[: match.start()].strip("_- ")
+    if not prefix:
+        return None
+    suffix = base[match.start() :].upper()
+    angles: List[str] = []
+    animation_letter: Optional[str] = None
+    index = 0
+    while index + 1 < len(suffix):
+        letter = suffix[index]
+        digit = suffix[index + 1]
+        if not letter.isalpha() or not digit.isdigit():
+            break
+        token = f"{letter}{digit}"
+        angles.append(token)
+        if animation_letter is None:
+            animation_letter = letter
+        index += 2
+    if not angles or animation_letter is None:
+        return None
+    animation_name = f"frame_{animation_letter.upper()}"
+    character_name = prefix.upper()
+    return CharacterFrameDescriptor(
+        character=character_name,
+        animation=animation_name,
+        frame_token=suffix,
+        angles=angles,
+    )
+
+
+def run_character_modeler_pipeline(
+    collector: CharacterSpriteCollector,
+    config: CharacterModelerConfig,
+    *,
+    dry_run: bool,
+) -> None:
+    if not CHARACTER_MODELER_AVAILABLE or PixSpriteCharacter is None:
+        logging.error("Pix2Vox+ integration requested but character_modeler.py is unavailable.")
+        return
+    characters = collector.iter_characters()
+    if not characters:
+        return
+    ensure_pix2vox_output_dir(config.output_dir)
+    logging.info("Generating Pix2Vox+ meshes for %d character(s)", len(characters))
+    for character in characters:
+        character_dir = config.output_dir / sanitize_pix2vox_name(character.name)
+        ensure_pix2vox_output_dir(character_dir)
+        mesh_path = character_dir / f"{sanitize_pix2vox_name(character.name)}.{config.mesh_format}"
+        views = prepare_pix2vox_views(character, config.max_angles)
+        if not views:
+            logging.warning("Character %s does not expose distinct viewing angles; skipping Pix2Vox+.", character.name)
+            continue
+        with stage_views_for_pix2vox(views) as staging_dir:
+            replacements = {
+                "input": staging_dir,
+                "output": str(mesh_path),
+                "weights": str(config.weights),
+                "format": config.mesh_format,
+                "device": config.device,
+                "name": character.name,
+            }
+            try:
+                run_pix2vox_command(config.command, replacements, dry_run=dry_run)
+            except Pix2VoxCommandError as exc:
+                logging.error("Pix2Vox+ failed for %s: %s", character.name, exc)
+                continue
+        for animation in character.animations:
+            write_keyframe_file(character_dir, animation, fps=config.fps)
+        write_character_metadata(character_dir, character, views, mesh_path, collector.sprite_root)
 
 def record_arcade_score(value: int) -> None:
     score = max(0, int(value))
@@ -1244,6 +1450,46 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated list of extra keywords that should classify textures as characters. "
             "Useful for WAD sprite lumps (e.g., PLAYA1) or custom folder names."
         ),
+    )
+    parser.add_argument(
+        "--pix2vox-command",
+        help=(
+            "Command template that invokes Pix2Vox+. Use placeholders {input}, {output}, {weights}, {format}, {device}, and {name}."
+        ),
+    )
+    parser.add_argument(
+        "--pix2vox-weights",
+        type=Path,
+        help="Path to the Pix2Vox+ checkpoint (.pth) that the command expects.",
+    )
+    parser.add_argument(
+        "--pix2vox-mesh-format",
+        choices=("obj", "ply", "gltf", "glb"),
+        default="obj",
+        help="Mesh format requested from Pix2Vox+. Default: obj.",
+    )
+    parser.add_argument(
+        "--pix2vox-device",
+        default="cuda",
+        help="Device identifier forwarded to the Pix2Vox+ command template (default: cuda).",
+    )
+    parser.add_argument(
+        "--pix2vox-max-angles",
+        type=int,
+        default=24,
+        help="Maximum number of unique sprite angles forwarded to Pix2Vox+.",
+    )
+    parser.add_argument(
+        "--pix2vox-fps",
+        type=float,
+        default=15.0,
+        help="Frame rate recorded in the generated animation keyframes (default: 15).",
+    )
+    parser.add_argument(
+        "--character-output-dir",
+        type=Path,
+        default=Path("characters"),
+        help="Directory that receives generated Pix2Vox+ character meshes and metadata.",
     )
     parser.add_argument(
         "--skip-types",
@@ -3601,11 +3847,15 @@ def process_pk3(
     keep_temp: bool,
     dry_run: bool,
     output_mode: str,
+    character_model_config: Optional[CharacterModelerConfig] = None,
 ) -> None:
     global Image
     temp_root = create_temp_dir(keep_temp)
     textures_dir = temp_root / "textures"
     textures_dir.mkdir(parents=True, exist_ok=True)
+    character_collector: Optional[CharacterSpriteCollector] = None
+    if character_model_config is not None and not dry_run:
+        character_collector = CharacterSpriteCollector(temp_root / "pix2vox_sprites")
 
     normalized_exts = {ext.strip().lower() for ext in texture_exts if ext.strip()}
     use_all = "*" in normalized_exts
@@ -3840,6 +4090,12 @@ def process_pk3(
                 if keep_temp:
                     delta_path = temp_input.with_name(f"{temp_input.stem}_alpha_delta.png")
                     metadata["alpha_delta_path"] = str(delta_path)
+                if character_collector is not None and category == "character":
+                    character_collector.add_frame(
+                        identifier=arcname,
+                        image_bytes=payload_bytes,
+                        extension=temp_extension,
+                    )
                 job = TextureJob(
                     input_path=temp_input,
                     output_path=enhanced_path,
@@ -4096,6 +4352,13 @@ def process_pk3(
         logging.warning("No textures with the selected extensions were found in %s", source)
     else:
         logging.info("Found %d texture(s) to upscale", texture_total)
+
+    if character_collector is not None and character_collector.has_characters() and character_model_config is not None:
+        run_character_modeler_pipeline(
+            collector=character_collector,
+            config=character_model_config,
+            dry_run=dry_run,
+        )
 
     if dry_run:
         cleanup_temp_dir(temp_root, keep_temp)
@@ -4700,6 +4963,7 @@ def process_wad(
     keep_temp: bool,
     dry_run: bool,
     output_mode: str,
+    character_model_config: Optional[CharacterModelerConfig] = None,
 ) -> None:
     temp_root = create_temp_dir(keep_temp)
     wad = read_wad(source)
@@ -4804,6 +5068,9 @@ def process_wad(
     diff_entry_map: Dict[str, Pk3ScaleEntry] = {}
     diff_normal_paths: set[str] = set()
     diff_spec_paths: set[str] = set()
+    character_collector: Optional[CharacterSpriteCollector] = None
+    if character_model_config is not None and not dry_run:
+        character_collector = CharacterSpriteCollector(temp_root / "pix2vox_sprites")
 
     for entry, category in filtered_entries:
         skip_large_texture = False
@@ -4849,6 +5116,17 @@ def process_wad(
         if keep_temp:
             delta_path = entry.path.with_name(f"{entry.path.stem}_alpha_delta.png")
             metadata["alpha_delta_path"] = str(delta_path)
+        if character_collector is not None and category == "character":
+            try:
+                staged_bytes = entry.path.read_bytes()
+            except Exception as exc:
+                logging.debug("Unable to stage %s for Pix2Vox+: %s", entry.lump_name, exc)
+            else:
+                character_collector.add_frame(
+                    identifier=entry.lump_name,
+                    image_bytes=staged_bytes,
+                    extension=entry.path.suffix,
+                )
         job = TextureJob(
             input_path=entry.path,
             output_path=enhanced_path,
@@ -5256,6 +5534,13 @@ def process_wad(
         )
         material_block = _build_material_block(material_records)
         material_bytes_diff = material_block.encode("ascii") if material_block else None
+
+    if character_collector is not None and character_collector.has_characters() and character_model_config is not None:
+        run_character_modeler_pipeline(
+            collector=character_collector,
+            config=character_model_config,
+            dry_run=dry_run,
+        )
 
     if dry_run:
         cleanup_temp_dir(temp_root, keep_temp)
@@ -8793,6 +9078,27 @@ def main() -> None:
         archive_type.upper(),
         args.output_mode,
     )
+    pix2vox_config: Optional[CharacterModelerConfig] = None
+    character_output_root = args.character_output_dir.resolve()
+    if args.pix2vox_command and args.pix2vox_weights:
+        if not CHARACTER_MODELER_AVAILABLE:
+            logging.error(
+                "Pix2Vox+ integration requested but character_modeler.py could not be imported; skipping character modeling.",
+            )
+        else:
+            source_dir_name = sanitize_pix2vox_name(input_path.stem)
+            target_output = character_output_root / source_dir_name
+            pix2vox_config = CharacterModelerConfig(
+                command=args.pix2vox_command,
+                weights=args.pix2vox_weights,
+                output_dir=target_output,
+                mesh_format=args.pix2vox_mesh_format,
+                device=args.pix2vox_device,
+                max_angles=max(1, int(args.pix2vox_max_angles)),
+                fps=float(args.pix2vox_fps),
+            )
+    elif args.pix2vox_command or args.pix2vox_weights:
+        logging.warning("Both --pix2vox-command and --pix2vox-weights are required to enable Pix2Vox+ modeling.")
     texture_exts = args.texture_extensions.split(",")
     for raw_keywords in getattr(args, "character_keywords", []):
         for token in raw_keywords.split(","):
@@ -8855,6 +9161,7 @@ def main() -> None:
                 keep_temp=args.keep_temp,
                 dry_run=args.dry_run,
                 output_mode=args.output_mode,
+                character_model_config=pix2vox_config,
             )
         else:
             process_wad(
@@ -8870,6 +9177,7 @@ def main() -> None:
                 keep_temp=args.keep_temp,
                 dry_run=args.dry_run,
                 output_mode=args.output_mode,
+                character_model_config=pix2vox_config,
             )
     except Exception as exc:  # noqa: BLE001 - top-level safety
         logging.error("Failed to enhance textures: %s", exc)
