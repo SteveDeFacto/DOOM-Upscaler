@@ -398,6 +398,96 @@ def derive_realesrgan_model_name(*candidates: Optional[object]) -> str:
     return ""
 
 
+def resolve_realesrgan_pth(args: argparse.Namespace) -> Tuple[Optional[Path], List[str]]:
+    """Locate the RealESRGAN .pth file from CLI args, env vars, or bundled defaults."""
+
+    def _unique_roots() -> List[Path]:
+        exec_dir, resource_dir = _runtime_directories()
+        roots: List[Path] = []
+        for root in (Path.cwd(), resource_dir, exec_dir):
+            try:
+                resolved = root.resolve()
+            except Exception:
+                continue
+            if resolved not in roots:
+                roots.append(resolved)
+        if not roots:
+            roots.append(Path.cwd().resolve())
+        return roots
+
+    search_roots = _unique_roots()
+    notes: List[str] = []
+    seen_paths: Set[str] = set()
+
+    def _expand(raw_value: object) -> List[Path]:
+        try:
+            candidate = Path(raw_value).expanduser()
+        except (TypeError, ValueError):
+            return []
+        if candidate.is_absolute():
+            return [candidate]
+        return [(root / candidate).resolve() for root in search_roots]
+
+    def _select(label: str, candidates: Sequence[Path]) -> Optional[Path]:
+        for candidate in candidates:
+            candidate_str = str(candidate)
+            if candidate_str in seen_paths:
+                continue
+            seen_paths.add(candidate_str)
+            if candidate.is_file():
+                notes.append(f"{label}: using RealESRGAN model at {candidate}")
+                return candidate
+            notes.append(f"{label}: RealESRGAN .pth not found at {candidate}")
+        return None
+
+    def _finalize(path: Optional[Path]) -> Optional[Path]:
+        if path is None:
+            return None
+        args.realesrgan_pth = path
+        model_name = derive_realesrgan_model_name(path)
+        if model_name:
+            setattr(args, "realesrgan_model_world", model_name)
+            setattr(args, "realesrgan_model_ui", model_name)
+        return path
+
+    cli_candidate = getattr(args, "realesrgan_pth", None)
+    if cli_candidate:
+        return _finalize(_select("CLI", _expand(cli_candidate))), notes
+
+    env_value = os.environ.get("REAL_ESRGAN_PTH", "").strip()
+    if env_value:
+        return _finalize(_select("REAL_ESRGAN_PTH", _expand(env_value))), notes
+
+    default_candidates: List[Path] = []
+    default_candidates.extend(_expand(DEFAULT_PTH_MODEL_NAME))
+    default_model_file = f"{DEFAULT_REAL_ESRGAN_MODEL}.pth"
+    for root in search_roots:
+        default_candidates.append((root / "models" / default_model_file).resolve())
+
+    resolved_default = _finalize(_select("DEFAULT", default_candidates))
+    if resolved_default:
+        return resolved_default, notes
+
+    auto_candidates: List[Path] = []
+    for root in search_roots:
+        models_dir = (root / "models").resolve()
+        if not models_dir.is_dir():
+            continue
+        try:
+            for entry in sorted(models_dir.glob("*.pth")):
+                auto_candidates.append(entry.resolve())
+        except Exception as exc:
+            notes.append(f"AUTO: unable to scan {models_dir} for models: {exc}")
+
+    resolved_auto = _finalize(_select("AUTO", auto_candidates))
+    if resolved_auto:
+        return resolved_auto, notes
+
+    search_labels = ", ".join(str(root) for root in search_roots)
+    notes.append(f"AUTO: no RealESRGAN .pth models found in search paths: {search_labels}")
+    return None, notes
+
+
 def lerp(a: float, b: float, t: float) -> float:
     clamped = max(0.0, min(1.0, float(t)))
     return a + (b - a) * clamped
@@ -461,6 +551,18 @@ class Pk3ScaleEntry:
     path: str
     offset_x: Optional[int] = None
     offset_y: Optional[int] = None
+
+    @property
+    def scale_x(self) -> float:
+        if self.original_width <= 0 or self.new_width <= 0:
+            return 1.0
+        return self.new_width / self.original_width
+
+    @property
+    def scale_y(self) -> float:
+        if self.original_height <= 0 or self.new_height <= 0:
+            return 1.0
+        return self.new_height / self.original_height
 
 
 @dataclass
@@ -705,6 +807,32 @@ MASK_KEYWORDS = (
     "_metal",
     "_ao",
     "_spec",
+)
+UI_KEYWORDS = (
+    "hud",
+    "hud/",
+    "/hud",
+    "ui/",
+    "/ui",
+    "ui_",
+    "menu",
+    "mnu",
+    "font",
+    "status",
+    "stbar",
+    "title",
+    "intermission",
+    "credit",
+    "credits",
+    "mugshot",
+    "help",
+    "cursor",
+    "dialog",
+    "console",
+    "crosshair",
+    "reticle",
+    "icon",
+    "option",
 )
 
 def _edt_1d(f: "np.ndarray") -> "np.ndarray":  # type: ignore[name-defined]
@@ -4453,8 +4581,28 @@ class CompositeTextureDef:
 
 @dataclass
 class PatchReplacement:
-    source_name: str
-    generated_path: Path
+    name: str
+    original_width: int
+    original_height: int
+    new_width: int
+    new_height: int
+    data: bytes
+    category: str
+    hires_name: str
+    offset_x: Optional[int] = None
+    offset_y: Optional[int] = None
+
+    @property
+    def scale_x(self) -> float:
+        if self.original_width <= 0 or self.new_width <= 0:
+            return 1.0
+        return self.new_width / self.original_width
+
+    @property
+    def scale_y(self) -> float:
+        if self.original_height <= 0 or self.new_height <= 0:
+            return 1.0
+        return self.new_height / self.original_height
 
 
 def read_wad(path: Path) -> WadFile:
@@ -4780,7 +4928,7 @@ def parse_texture_lump(data: bytes, patch_names: Sequence[str]) -> List[Composit
         height = struct.unpack_from("<H", data, offset + 14)[0]
         patch_count = struct.unpack_from("<H", data, offset + 20)[0]
         pos = offset + 22
-        patches: List[TexturePatchRef] = []
+        patches: List[CompositeTexturePatch] = []
         for _ in range(patch_count):
             if pos + 10 > len(data):
                 break
@@ -4791,7 +4939,7 @@ def parse_texture_lump(data: bytes, patch_names: Sequence[str]) -> List[Composit
             patch_name = patch_names[patch_index]
             if not patch_name:
                 continue
-            patches.append(TexturePatchRef(name=patch_name, origin_x=origin_x, origin_y=origin_y))
+            patches.append(CompositeTexturePatch(name=patch_name, origin_x=origin_x, origin_y=origin_y))
         if patches:
             textures.append(CompositeTextureDef(name=name, width=width, height=height, patches=patches))
     return textures
